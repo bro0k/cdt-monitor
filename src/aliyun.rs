@@ -29,7 +29,8 @@
 //!
 //! ## 重试
 //!
-//! 仅对**可恢复**错误重试最多 2 次（指数退避 200ms / 600ms）：
+//! CDT 单次超时 8 秒、最多尝试 2 次；其余接口单次 4 秒、最多尝试 3 次。
+//! 仅对**可恢复**错误退避重试（200ms / 600ms）：
 //! 网络层失败、HTTP 5xx、阿里云 `Throttling*` / `ServiceUnavailable` /
 //! `InternalError` 等瞬态错误码。参数错误、鉴权失败等 4xx 直接返回，
 //! 避免无意义地放大调用。
@@ -414,7 +415,7 @@ impl AliyunClient {
     // 底层 RPC
     // -----------------------------------------------------------------------
 
-    /// 发起一次 RPC GET 请求（含最多 2 次退避重试）。
+    /// 发起 RPC GET 请求。CDT 最多尝试 2 次，其余接口最多 3 次。
     async fn call(
         &self,
         endpoint: &str,
@@ -422,14 +423,21 @@ impl AliyunClient {
         action: &str,
         extra: Vec<(&str, String)>,
     ) -> Result<Value, AliyunError> {
-        const MAX_ATTEMPTS: usize = 3;
+        let (max_attempts, timeout_ms) = if action == "ListCdtInternetTraffic" {
+            (2, 8_000)
+        } else {
+            (3, 4_000)
+        };
         let mut last_error: Option<AliyunError> = None;
         let began = crate::models::now_ms();
         let mut attempts = 0;
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..max_attempts {
             attempts += 1;
-            match self.call_once(endpoint, version, action, &extra).await {
+            match self
+                .call_once(endpoint, version, action, &extra, timeout_ms)
+                .await
+            {
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     let retryable = err.is_retryable();
@@ -437,7 +445,7 @@ impl AliyunClient {
                         err,
                         &[&self.access_key_id, &self.access_key_secret],
                     ));
-                    if !retryable || attempt + 1 >= MAX_ATTEMPTS {
+                    if !retryable || attempt + 1 >= max_attempts {
                         break;
                     }
                     // 200ms -> 600ms
@@ -477,6 +485,7 @@ impl AliyunClient {
         version: &str,
         action: &str,
         extra: &[(&str, String)],
+        timeout_ms: u64,
     ) -> Result<Value, AliyunError> {
         let mut params: BTreeMap<String, String> = BTreeMap::new();
         params.insert("AccessKeyId".to_string(), self.access_key_id.clone());
@@ -523,31 +532,30 @@ impl AliyunClient {
         let request = Request::new_with_init(&url, &init)
             .map_err(|e| AliyunError::Local(format!("构造请求失败：{e}")))?;
 
-        let (status, body) =
-            crate::runtime::fetch_text(request, 4_000)
-                .await
-                .map_err(|message| {
-                    let lower = message.to_ascii_lowercase();
-                    let safe = if message == crate::runtime::TIMEOUT_MESSAGE {
-                        message
-                    } else if lower.contains("dns")
-                        || lower.contains("nxdomain")
-                        || lower.contains("resolve")
-                    {
-                        "DNS 解析失败".into()
-                    } else if lower.contains("tls") || lower.contains("certificate") {
-                        "TLS 连接失败".into()
-                    } else {
-                        "网络连接失败".into()
-                    };
-                    AliyunError::Network(safe)
-                })?;
+        let (status, body) = crate::runtime::fetch_text(request, timeout_ms)
+            .await
+            .map_err(|message| {
+                let lower = message.to_ascii_lowercase();
+                let safe = if message == crate::runtime::TIMEOUT_MESSAGE {
+                    message
+                } else if lower.contains("dns")
+                    || lower.contains("nxdomain")
+                    || lower.contains("resolve")
+                {
+                    "DNS 解析失败".into()
+                } else if lower.contains("tls") || lower.contains("certificate") {
+                    "TLS 连接失败".into()
+                } else {
+                    "网络连接失败".into()
+                };
+                AliyunError::Network(safe)
+            })?;
 
         let value = parse_rpc_response(status, &body, action)?;
         if action == "ListCdtInternetTraffic" && !CdtTraffic::has_details(&value) {
             return Err(AliyunError::Api {
                 code: "EmptyTrafficDetails".into(),
-                message: "ListCdtInternetTraffic 连续 3 次未取得有效流量明细，请稍后重试".into(),
+                message: "ListCdtInternetTraffic 未返回有效流量明细，请稍后重试".into(),
                 request_id: value
                     .get("RequestId")
                     .and_then(Value::as_str)
@@ -567,7 +575,7 @@ impl AliyunClient {
     /// 调用 `ListCdtInternetTraffic`，空明细重试耗尽后返回错误，
     /// 防止把尚未返回的计量数据当作零流量覆盖已有快照。
     pub async fn query_cdt_traffic(&self) -> Result<CdtTraffic, AliyunError> {
-        // 空明细与限流/网络失败共用一次重试预算，最多 3 次请求，避免嵌套放大。
+        // 空明细与限流/网络失败共用一次重试预算，最多 2 次请求，避免嵌套放大。
         // RegionId 与上游一致；该全局接口返回当前计费周期内的累计值。
         let value = self
             .call(

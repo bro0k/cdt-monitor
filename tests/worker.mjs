@@ -113,6 +113,7 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
           const { status, body } = state.trafficResponses.shift()
           return new Response(body, { status })
         }
+        if (state.trafficDelay) await new Promise(resolve => setTimeout(resolve, state.trafficDelay))
         if (trafficGate) await trafficGate
         if (state.stallTraffic) return new Promise(() => {})
         if (state.stallBody) return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')); } }), { headers: { 'content-type': 'application/json' } })
@@ -317,11 +318,10 @@ try {
   state.trafficResponses = [
     { status: 200, body: '{"TrafficDetails":[]}' },
     { status: 200, body: '{"Data":{"TrafficDetails":[]}}' },
-    { status: 200, body: '{}' },
   ]
   const emptyJob = await refresh('failed')
-  assert.match(emptyJob.error_msg, /连续 3 次未取得有效流量明细/)
-  assert.equal(state.trafficCalls - emptyCalls, 3)
+  assert.match(emptyJob.error_msg, /未返回有效流量明细/)
+  assert.equal(state.trafficCalls - emptyCalls, 2)
   const afterEmpty = await snapshot()
   for (const field of ['billing_month', 'cdt_domestic_bytes', 'cdt_overseas_bytes', 'traffic_updated_at', 'threshold_triggered_month', 'threshold_limit_gb']) {
     assert.equal(afterEmpty[field], beforeEmpty[field], `empty traffic must preserve ${field}`)
@@ -351,10 +351,10 @@ try {
     assert.equal(new Set(state.trafficAttempts.map(a => a.signature)).size, 2)
     assert.ok(state.trafficAttempts.every(a => a.timestamp && Number.isFinite(Date.parse(a.timestamp))))
   }
-  state.trafficResponses = Array.from({ length: 3 }, () => ({ status: 429, body: 'Too Many Requests' }))
+  state.trafficResponses = Array.from({ length: 2 }, () => ({ status: 429, body: 'Too Many Requests' }))
   state.trafficAttempts = []
   await refresh('failed')
-  assert.equal(state.trafficAttempts.length, 3, 'persistent throttling must stop after three attempts')
+  assert.equal(state.trafficAttempts.length, 2, 'persistent throttling must stop after two attempts')
   state.trafficFailed = true
   state.trafficAttempts = []
   await refresh('failed')
@@ -373,15 +373,15 @@ try {
   const safeErrorJob = await refresh('failed')
   assert.ok(safeErrorJob.error_msg.includes('fixture-request-context'))
   for (const value of ['fixture-access-key', 'fixture-secret', 'Signature=', 'https://']) assert.equal(safeErrorJob.error_msg.includes(value), false)
-  state.trafficResponses = [{ status: 429, body: 'limit' }, { status: 200, body: '{"TrafficDetails":[]}' }, { status: 503, body: 'unavailable' }]
+  state.trafficResponses = [{ status: 429, body: 'limit' }, { status: 200, body: '{"TrafficDetails":[]}' }]
   state.trafficAttempts = []
   await refresh('failed')
-  assert.equal(state.trafficAttempts.length, 3, 'empty responses and transient errors share one total retry budget')
+  assert.equal(state.trafficAttempts.length, 2, 'empty responses and transient errors share one total retry budget')
   const instancesBeforeFailure = state.instanceCalls
   state.trafficAttempts = []
-  state.trafficResponses = Array.from({ length: 3 }, () => ({ status: 503, body: 'unavailable' }))
+  state.trafficResponses = Array.from({ length: 2 }, () => ({ status: 503, body: 'unavailable' }))
   await cronAccount(worker, id)
-  assert.equal(state.trafficAttempts.length, 3)
+  assert.equal(state.trafficAttempts.length, 2)
   assert.equal(state.instanceCalls, instancesBeforeFailure + 1, 'exhausted cloud retries must not replay successful ECS collection')
   state.trafficFailed = true
   state.trafficAttempts = []
@@ -1109,10 +1109,22 @@ try {
   await api('settings/telegram', 'PUT', { enabled: false })
   console.log('✓ 日报生成或推送失败均释放租约，恢复后重试发送，送达后去重')
 
+  // 超过旧的 4 秒限制，但在新的 8 秒内完成，应一次请求成功。
+  state.trafficDelay = 4500
+  const delayedCalls = state.trafficCalls
+  await refresh()
+  assert.equal(state.trafficCalls, delayedCalls + 1)
+  state.trafficDelay = 0
+  console.log('✓ CDT 超过 4 秒的响应可在 8 秒预算内一次完成')
+
   state.stallTraffic = true
+  const stalledCalls = state.trafficCalls
   let began = Date.now()
   const stalled = await refresh('failed')
   assert.match(stalled.error_msg, /流量查询失败，网络连接超时，稍后重试.*cdt\.aliyuncs\.com/)
+  assert.equal(state.trafficCalls, stalledCalls + 2)
+  assert.match(stalled.error_msg, /尝试 2 次/)
+  assert.ok(Date.now() - began >= 16_000, 'each CDT attempt should have the full 8 second budget')
   assert.ok(Date.now() - began < 25_000, 'stalled headers must respect request budget')
   state.stallTraffic = false
   state.stallBody = true
